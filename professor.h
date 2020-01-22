@@ -235,6 +235,27 @@ prof_record_read_clear(Prof *prof, ProfIdx record_i, uint32_t *hits_n, uint32_t 
 }
 
 static void
+prof_dump_still_open(FILE *out, Prof const *prof)
+{
+    for (ProfIdx top_i = prof->open_record_smpl_tree_i;
+         ~top_i;
+         top_i = prof->record_smpl_tree[top_i].parent_i)
+    {
+        ProfRecordSmpl smpl = prof->record_smpl_tree[top_i];
+        ProfRecord     record = prof->records[smpl.record_i];
+        fprintf(out, "sample: %d, record[%d]: %s (%s[%u])\n",
+                top_i, smpl.record_i,
+                record.name,
+                record.filename,
+                record.line_num);
+
+        if (top_i == prof->record_smpl_tree[top_i].parent_i)
+        {   break;   }
+    }
+    fputc('\n', out);
+}
+
+static void
 prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
 {
     double ms = (prof->freq
