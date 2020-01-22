@@ -9,10 +9,13 @@
 #include <stdio.h>
 #include <assert.h>
 
+#include <intrin.h> // __rdtsc()
+
 // TODO: for DLLs prof_set_global_state
 // TODO: atomics
 // TODO: multiple threads
 // TODO: make skippable without having to find closing tag
+// TODO: combine hashmap array with normal dynamic array (hash -> index)
 
 // NOTE: if not defined, these are not atomic!
 #ifndef prof_atomic_add
@@ -52,20 +55,19 @@ typedef struct ProfRecordSmpl {
 } ProfRecordSmpl;
 
 typedef struct Prof {
-    ProfRecord     *records; // dynamic array
+    ProfRecord *records; // dynamic array
     ProfIdx     records_n;
     ProfIdx     records_m;
 
-    ProfRecordSmpl *record_tree; // dynamic
-    ProfIdx     record_tree_n;
-    ProfIdx     record_tree_m;
-    // TODO: per thread (if you know the end pointer per thread, you can follow back...) <= WRONG! only for current function stack. Need finished stacks as well
-    ProfIdx open_record_tree_i; // the deepest record that is still open (check if this record is closed to see if all are closed)
+    ProfRecordSmpl *record_smpl_tree; // dynamic
+    ProfIdx     record_smpl_tree_n;
+    ProfIdx     record_smpl_tree_m;
+    ProfIdx open_record_smpl_tree_i; // the deepest record that is still open (check if this record is closed to see if all are closed)
 
     uint64_t freq;
 
     // NOTE: this is needed so that different allocators aren't used across dll boundaries
-    void *(*realloc)(void *allocator, void *ptr, size_t size);
+    void *(*reallocate)(void *allocator, void *ptr, size_t size);
     void *allocator;
 } Prof;
 
@@ -83,14 +85,14 @@ prof_grow(Prof *prof, void *ptr, ProfIdx *max, size_t elem_size)
 {
     // TODO: make threadsafe
 
-    if (! prof->realloc)
-    {   prof->realloc = prof_realloc;   }
+    if (! prof->reallocate)
+    {   prof->reallocate = prof_realloc;   }
 
     *max = (*max
             ? *max * 2
             : 64);
     size_t size = *max * elem_size;
-    void *result = prof->realloc(prof->allocator, ptr, size);
+    void *result = prof->reallocate(prof->allocator, ptr, size);
     return result;
 }
 
@@ -98,8 +100,9 @@ static inline ProfIdx
 prof_top_record_i(Prof *prof)
 {
     // TODO: thread id...
-    ProfIdx result = (prof->record_tree_n
-                      ? prof->record_tree[prof->open_record_tree_i].record_i
+    ProfIdx result = ((prof->record_smpl_tree_n &&
+                       ~prof->open_record_smpl_tree_i)
+                      ? prof->record_smpl_tree[prof->open_record_smpl_tree_i].record_i
                       : ~(ProfIdx) 0);
     return result;
 }
@@ -125,10 +128,12 @@ static inline void
 prof_start_(Prof *prof, ProfIdx record_i)
 {
     uint64_t cycles_start = __rdtsc();
-    ProfIdx  parent_i = prof->open_record_tree_i;
+    ProfIdx  parent_i = (~ prof->open_record_smpl_tree_i
+                         ? prof->open_record_smpl_tree_i
+                         : prof->record_smpl_tree_n);
 
-    if (prof->record_tree_n == prof->record_tree_m)
-    {   prof->record_tree = (ProfRecordSmpl *)prof_grow(prof, prof->record_tree, &prof->record_tree_m, sizeof(*prof->record_tree));   }
+    if (prof->record_smpl_tree_n == prof->record_smpl_tree_m)
+    {   prof->record_smpl_tree = (ProfRecordSmpl *)prof_grow(prof, prof->record_smpl_tree, &prof->record_smpl_tree_m, sizeof(*prof->record_smpl_tree));   }
 
     ProfRecordSmpl record_smpl; {
         record_smpl.record_i     = record_i;
@@ -137,8 +142,27 @@ prof_start_(Prof *prof, ProfIdx record_i)
         record_smpl.cycles_end   = ~(uint64_t) 0;
     };
 
-    prof->open_record_tree_i = prof->record_tree_n++;
-    prof->record_tree[prof->open_record_tree_i] = record_smpl;
+    prof->open_record_smpl_tree_i = prof->record_smpl_tree_n++;
+    prof->record_smpl_tree[prof->open_record_smpl_tree_i] = record_smpl;
+}
+
+static inline void
+prof_mark_(Prof *prof, ProfIdx record_i)
+{
+    uint64_t cycles = __rdtsc();
+    ProfIdx  parent_i = prof->open_record_smpl_tree_i;
+
+    if (prof->record_smpl_tree_n == prof->record_smpl_tree_m)
+    {   prof->record_smpl_tree = (ProfRecordSmpl *)prof_grow(prof, prof->record_smpl_tree, &prof->record_smpl_tree_m, sizeof(*prof->record_smpl_tree));   }
+
+    ProfRecordSmpl record_smpl; {
+        record_smpl.record_i     = record_i;
+        record_smpl.parent_i     = parent_i;
+        record_smpl.cycles_start = cycles;
+        record_smpl.cycles_end   = cycles;
+    };
+
+    prof->record_smpl_tree[prof->record_smpl_tree_n++] = record_smpl;
 }
 
 #define PROF_CAT1(a,b) a ## b
@@ -147,13 +171,23 @@ prof_start_(Prof *prof, ProfIdx record_i)
 #define prof_static_local_record_i_ PROF_CAT(prof_static_local_record_i_, __LINE__)
 #define prof_scope_once PROF_CAT(prof_scope_once, __LINE__)
 
+#define PROF_NEW_RECORD(prof, name) \
+    static ProfIdx prof_static_local_record_i_ = ~(ProfIdx) 0; \
+    if (! ~prof_static_local_record_i_) /* TODO: atomic */ \
+    {   prof_static_local_record_i_ = prof_new_record(prof, name, __FILE__, __LINE__);   } 
+
 #define prof_start(prof, name) \
     do { \
-        static ProfIdx prof_static_local_record_i_ = ~(ProfIdx) 0; \
-        if (! ~prof_static_local_record_i_) /* TODO: atomic */ \
-        {   prof_static_local_record_i_ = prof_new_record(prof, name, __FILE__, __LINE__);   } \
+        PROF_NEW_RECORD(prof, name) \
         prof_start_(prof, prof_static_local_record_i_); \
     } while (0)
+
+#define prof_mark(prof, name) \
+    do { \
+        PROF_NEW_RECORD(prof, name) \
+        prof_mark_(prof, prof_static_local_record_i_); \
+    } while (0)
+
 
 // NOTE: can't nest without braces
 #define prof_scope(prof, name) prof_scope_n(prof, name, 1)
@@ -164,16 +198,24 @@ prof_start_(Prof *prof, ProfIdx record_i)
 static inline ProfIdx
 prof_end_n(Prof *prof, uint32_t hits_n)
 {
-    assert(prof->record_tree_n);
-    ProfRecordSmpl *record_smpl     = &prof->record_tree[prof->open_record_tree_i];
-    uint64_t       cycles_end       = __rdtsc();
-    uint64_t       cycles_n         = cycles_end - record_smpl->cycles_start;
-    uint64_t       hits_n__cycles_n = (uint64_t)cycles_n | ((uint64_t)hits_n << 32);
+    assert(prof->record_smpl_tree   &&
+           prof->record_smpl_tree_n &&
+           "no record samples taken at all - nothing to close");
+    assert(~prof->open_record_smpl_tree_i &&
+           "no open prof records - you've already closed them all. Mismatched start and end records?");
+
+    ProfRecordSmpl *record_smpl      = &prof->record_smpl_tree[prof->open_record_smpl_tree_i];
+    uint64_t        cycles_end       = __rdtsc();
+    uint64_t        cycles_n         = cycles_end - record_smpl->cycles_start;
+    uint64_t        hits_n__cycles_n = (uint64_t)cycles_n | ((uint64_t)hits_n << 32);
 
     record_smpl->cycles_end = cycles_end;
-    prof_atomic_add(&prof->records[record_smpl->record_i].hits_n__cycles_n, hits_n__cycles_n);
+    prof_atomic_add(&prof->records[record_smpl->record_i].hits_n__cycles_n, hits_n__cycles_n); // TODO: this could be done after the fact
 
-    prof->open_record_tree_i = record_smpl->parent_i;
+    int is_tree_root = prof->open_record_smpl_tree_i == record_smpl->parent_i;
+    prof->open_record_smpl_tree_i = (! is_tree_root
+                                     ? record_smpl->parent_i
+                                     : ~(ProfIdx) 0);
 
     return record_smpl->record_i;
 }
@@ -211,33 +253,51 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
     if (! is_first_dump)
     {   fputs(",\n\n", out);   }
 
-    ProfRecordSmpl *record_tree   = prof->record_tree;
-    size_t          record_tree_n = prof->record_tree_n;
-    for (size_t record_tree_i = 0; record_tree_i < record_tree_n; ++record_tree_i)
+    ProfRecordSmpl *record_smpl_tree   = prof->record_smpl_tree;
+    size_t          record_smpl_tree_n = prof->record_smpl_tree_n;
+    for (size_t record_smpl_tree_i = 0; record_smpl_tree_i < record_smpl_tree_n; ++record_smpl_tree_i)
     {
         // TODO: units
-        ProfRecordSmpl record_smpl = record_tree[record_tree_i];
+        ProfRecordSmpl record_smpl = record_smpl_tree[record_smpl_tree_i];
         ProfRecord     record      = records[record_smpl.record_i];
-        if (record_tree_i > 0)
+        if (record_smpl_tree_i > 0)
         {   fprintf(out, ",\n");   }
-        fprintf(out, "    {"
-                "\"name\":\"%s\", "
-                "\"ph\":\"X\", "
-                "\"ts\": %lf, "
-                "\"dur\": %lf, "
-                "\"pid\": 0, "
-                "\"tid\": 0"
-                "}",
-                /* record.filename, */
-                record.name,
-                record_smpl.cycles_start / ms,
-                (record_smpl.cycles_end - record_smpl.cycles_start) / ms
-                );
 
+        if (record_smpl.cycles_start != record_smpl.cycles_end)
+        { // normal record
+            fprintf(out, "    {"
+                    "\"name\":\"%s\", "
+                    "\"ph\":\"X\", "
+                    "\"ts\": %lf, "
+                    "\"dur\": %lf, "
+                    "\"pid\": 0, "
+                    "\"tid\": 0"
+                    "}",
+                    /* record.filename, */
+                    record.name,
+                    record_smpl.cycles_start / ms,
+                    (record_smpl.cycles_end - record_smpl.cycles_start) / ms
+            );
+        }
+
+        else
+        { // mark
+            fprintf(out, "    {"
+                    "\"name\":\"%s\", "
+                    "\"ph\":\"i\", "
+                    "\"ts\": %lf, "
+                    "\"pid\": 0, "
+                    "\"tid\": 0"
+                    "}",
+                    /* record.filename, */
+                    record.name,
+                    record_smpl.cycles_start / ms
+            );
+        }
     }
     fflush(out);
 
-    prof->record_tree_n = 0;
+    prof->record_smpl_tree_n = 0;
 }
 
 static inline FILE *
