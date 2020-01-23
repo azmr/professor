@@ -67,6 +67,7 @@ typedef enum ProfPtrAction {
     PROF_PTR_free,
 } ProfPtrAction;
 
+// TODO: could do some sort of linked list to connect reallocs?
 typedef struct ProfPtrSmpl { // key'd by addr
     ProfIdx   record_i;
     uintptr_t addr;
@@ -420,9 +421,8 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
     ProfPtrSmpl *ptr_smpls   = prof->ptr_smpls;
     size_t       ptr_smpls_n = prof->ptr_smpls_n;
 
-    // TODO:
-    /* ProfPtrSmpl **open = 0; */
-    /* ProfIdx open_n = 0, open_m = 0; */
+    ProfPtrSmpl **opens = 0;
+    ProfIdx open_n = 0, open_m = 0;
 
     { // introduce all data series
         fprintf(out, "    {"
@@ -446,13 +446,57 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
                 "\"tid\": 0"
                 "}");
 
-        fputs(",", out);
+        fputs(",\n\n", out);
     }
 
     for (size_t ptr_smpls_i = 0; ptr_smpls_i < ptr_smpls_n; ++ptr_smpls_i)
     { // memory count
         ProfPtrSmpl ptr_smpl = ptr_smpls[ptr_smpls_i];
         ProfRecord  record   = records[ptr_smpl.record_i];
+
+        { // update open array
+            if (ptr_smpl.size > 0)
+            { // some mem was (re)alloc'd
+                if (ptr_smpl.addr_p) // realloc
+                { // replace open ptr with this one
+                    ProfIdx already_open_i = ~(ProfIdx)0;
+                    for (ProfIdx open_i = 0; open_i < open_n; ++open_i)
+                    { // check if this pointer has been alloc'd but not freed
+                        ProfPtrSmpl *open = opens[open_i];
+
+                        assert(open->addr != ptr_smpl.addr && "the same address cannot be opened multiple times");
+
+                        if (open->addr == ptr_smpl.addr_p)
+                        {   already_open_i = open_i; break;   }
+                    }
+                    assert(~already_open_i && "there must be a pointer to replace");
+                    opens[already_open_i] = &ptr_smpls[ptr_smpls_i];
+                }
+
+                else // straight alloc
+                { // append current smpl to open list
+                    if (open_n == open_m)
+                    {   opens = (ProfPtrSmpl **)prof_grow(prof, opens, &open_m, sizeof(*opens));   }
+                    ptr_smpls = prof->ptr_smpls; // the allocation from prof_grow may have moved the array
+
+                    opens[open_n++] = &ptr_smpls[ptr_smpls_i];
+                }
+            }
+
+            else // free
+            { // endswap remove open smpl
+                ProfIdx already_open_i = ~(ProfIdx)0;
+                for (ProfIdx open_i = 0; open_i < open_n; ++open_i)
+                { // check if this pointer has been alloc'd but not freed
+                    ProfPtrSmpl *open = opens[open_i];
+                    if (open->addr == ptr_smpl.addr)
+                    {   already_open_i = open_i; break;   }
+                }
+                assert(~already_open_i && "there must be a pointer to remove");
+                opens[already_open_i] = opens[--open_n];
+            }
+        }
+
         if (ptr_smpls_i > 0)
         {   fputs(",\n", out);   }
 
@@ -462,21 +506,16 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
                 "\"ts\": %lf, "
                 "\"args\": {"
                 , ptr_smpl.cycles / ms
-                );
+        );
 
-        for (size_t ptr_smpls_j = 0; ptr_smpls_j < ptr_smpls_i; ++ptr_smpls_j)
+        for (size_t open_i = 0; open_i < open_n; ++open_i)
         {
-            ProfPtrSmpl ptr_smpl = ptr_smpls[ptr_smpls_j];
-            ProfRecord  record   = records[ptr_smpl.record_i];
+            ProfPtrSmpl open = *opens[open_i];
 
-            if (ptr_smpls_j > 0)
+            if (open_i > 0)
             {   fputs(",", out);   }
 
-            if (ptr_smpl.addr_p &&
-                ptr_smpl.addr_p != ptr_smpl.addr)
-            {   fprintf(out, "\"0x%08llx\": 0,", ptr_smpl.addr_p);   }
-
-            fprintf(out, "\"0x%08llx\": %llu", ptr_smpl.addr, ptr_smpl.size);
+            fprintf(out, "\"0x%08llx\": %llu", open.addr, open.size);
         }
 
         fprintf(out,
@@ -484,21 +523,41 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
                 "\"pid\": 0, "
                 "\"tid\": 0"
                 "}");
-
-/*         if (ptr_smpl.size > 0) */
-/*         { */
-/*             if (open_n == open_m) */
-/*             {   open = (ProfPtrSmpl **)prof_grow(prof, open, &open_m, sizeof(*open));   } */
-
-/*             open[open_n++] = &ptr_smpls[ptr_smpls_i]; */
-/*         } */
-/*         else for (size open_i = 0; open_i < open_n; ++open_i) */
-/*         { */
-
-/*         } */
     }
+    
+    { // continue still open memory to last profiling time
+        uint64_t final_cycles = 0;
+        for (ProfIdx smpl_i = 0; smpl_i < record_smpl_tree_n; ++ smpl_i)
+        { // find last profiling time
+            uint64_t smpl_cycles = record_smpl_tree[smpl_i].cycles_end;
+            if (smpl_cycles > final_cycles)
+            {   final_cycles = smpl_cycles;   } // NOTE: there's a slight discrepancy here, I think due to rounding from "dur" = begin + (end-begin)
+        }
 
-    // TODO: continue open memory to last profiling time
+        fprintf(out, ",\n    {"
+                "\"name\":\"memory\", "
+                "\"ph\":\"C\", "
+                "\"ts\": %lf, "
+                "\"args\": {"
+                , final_cycles / ms
+        );
+
+        for (ProfIdx open_i = 0; open_i < open_n; ++open_i)
+        {
+            ProfPtrSmpl open = *opens[open_i];
+
+            if (open_i > 0)
+            {   fputs(",", out);   }
+
+            fprintf(out, "\"0x%08llx\": %llu", open.addr, open.size);
+        }
+
+        fprintf(out,
+                "}, "
+                "\"pid\": 0, "
+                "\"tid\": 0"
+                "}");
+    }
 
     fflush(out);
 
