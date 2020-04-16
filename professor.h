@@ -270,12 +270,13 @@ prof_ptr_realloc_(Prof *prof, ProfIdx record_i, void *addr, void *addr_p, size_t
 #define PROF_NEW_RECORD(prof, name) \
     static ProfIdx prof_static_local_record_i_ = ~(ProfIdx) 0; \
     if (! ~prof_static_local_record_i_) /* TODO: atomic */ \
-    {   prof_static_local_record_i_ = prof_new_record(prof, name, __FILE__, __LINE__);   } 
+    {   prof_static_local_record_i_ = prof_new_record(prof, name, __FILE__, __LINE__);   } \
 
 #define prof_start(prof, name) \
     do { \
         PROF_NEW_RECORD(prof, name) \
         prof_start_(prof, prof_static_local_record_i_); \
+        /* __itt_task_begin(0, __itt_null, __itt_null, __itt_string_handle_createA(name));\ */ \
     } while (0)
 
 #define prof_mark(prof, name) \
@@ -297,12 +298,14 @@ prof_ptr_realloc_(Prof *prof, ProfIdx record_i, void *addr, void *addr_p, size_t
 // NOTE: can't nest without braces
 #define prof_scope(prof, name) prof_scope_n(prof, name, 1)
 #define prof_scope_n(prof, name, n) prof_start(prof, name); \
-    for (int prof_scope_once = 0; prof_scope_once++ == 0; prof_end_n(prof, n))
+    for (int prof_scope_once = 0; prof_scope_once++ == 0; prof_end_n_unchecked(prof, n))
+#define prof_exit_scope continue
 
 // returns the index of the record referenced, so you can double check this is correct
 static inline ProfIdx
-prof_end_n(Prof *prof, uint32_t hits_n)
+prof_end_n_unchecked(Prof *prof, uint32_t hits_n)
 {
+    /* __itt_task_end(0); */
     assert(prof->record_smpl_tree   &&
            prof->record_smpl_tree_n &&
            "no record samples taken at all - nothing to close");
@@ -326,9 +329,25 @@ prof_end_n(Prof *prof, uint32_t hits_n)
 }
 
 static inline ProfIdx
-prof_end(Prof *prof)
-{   return prof_end_n(prof, 1);   }
+prof_end_n(Prof *prof, ProfIdx expected_record_i, uint32_t hits_n)
+{
+    ProfIdx actual_record_i = prof_end_n_unchecked(prof, hits_n);
+    assert((!~expected_record_i || // if you don't want to check here
+            actual_record_i == expected_record_i) && "prof start and end don't seem to match");
+    return actual_record_i;
+}
 
+static inline ProfIdx
+prof_end(Prof *prof, ProfIdx expected_record_i)
+{   return prof_end_n(prof, expected_record_i, 1);   }
+
+static inline ProfIdx
+prof_end_unchecked(Prof *prof)
+{   return prof_end_n_unchecked(prof, 1);   }
+
+#define prof_start_fn(prof) prof_start(prof, __func__); ProfIdx prof_fn_local_record_i = prof_top_record_i(prof)
+#define prof_end_n_fn(prof, n)   prof_end_n(prof, prof_fn_local_record_i, n)
+#define prof_end_fn(prof)        prof_end_n_fn(prof, 1)
 
 #if 1 // OUTPUT
 
@@ -416,6 +435,7 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
         }
     }
 
+#if 0 // MEMORY sampling
     fprintf(out, ",\n\n");
 
     ProfPtrSmpl *ptr_smpls   = prof->ptr_smpls;
@@ -449,7 +469,7 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
         fputs(",\n\n", out);
     }
 
-    for (size_t ptr_smpls_i = 0; ptr_smpls_i < ptr_smpls_n; ++ptr_smpls_i)
+    for (size_t ptr_smpls_i = 0; 0 && ptr_smpls_i < ptr_smpls_n; ++ptr_smpls_i)
     { // memory count
         ProfPtrSmpl ptr_smpl = ptr_smpls[ptr_smpls_i];
         ProfRecord  record   = records[ptr_smpl.record_i];
@@ -464,7 +484,9 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
                     { // check if this pointer has been alloc'd but not freed
                         ProfPtrSmpl *open = opens[open_i];
 
-                        assert(open->addr != ptr_smpl.addr && "the same address cannot be opened multiple times");
+                        assert((ptr_smpl.addr == ptr_smpl.addr_p || // realloc'ing in place
+                                ptr_smpl.addr != open->addr)
+                               && "the same address cannot be opened multiple times");
 
                         if (open->addr == ptr_smpl.addr_p)
                         {   already_open_i = open_i; break;   }
@@ -558,6 +580,7 @@ prof_dump_timings_file(FILE *out, Prof *prof, int is_first_dump)
                 "\"tid\": 0"
                 "}");
     }
+#endif
 
     fflush(out);
 
